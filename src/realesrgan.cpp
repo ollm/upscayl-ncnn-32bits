@@ -228,17 +228,6 @@ RealESRGAN::RealESRGAN(int gpuid, bool _tta_mode, bool _fp32_mode)
         net.opt.use_int8_arithmetic = false;
     }
     else
-    {
-        net.opt.use_fp16_packed = true;
-        net.opt.use_fp16_storage = true;
-        net.opt.use_fp16_arithmetic = false;
-        net.opt.use_int8_storage = true;
-        net.opt.use_int8_arithmetic = false;
-    }
-
-    // Workaround for AMD RDNA2 (bug driver Vulkan) https://github.com/Tencent/ncnn/issues/6501#issuecomment-3731438810
-    // net.opt.use_cooperative_matrix = false; Fixed in https://github.com/Tencent/ncnn/pull/6504
-
     net.set_vulkan_device(gpuid);
 
     realesrgan_preproc = 0;
@@ -545,9 +534,11 @@ int RealESRGAN::load(const std::string &parampath, const std::string &modelpath)
 int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage) const
 {
     const unsigned char *pixeldata = (const unsigned char *)inimage.data;
+    const bool input_16bit = inimage.elemsize == 4u && inimage.elempack == 1;
+    const float *pixeldata_float = (const float *)inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
-    const int channels = inimage.elempack;
+    const int channels = input_16bit ? inimage.c : inimage.elempack;
 
     const int TILE_SIZE_X = tilesize;
     const int TILE_SIZE_Y = tilesize;
@@ -583,7 +574,19 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage) const
         int in_tile_y1 = std::min((yi + 1) * TILE_SIZE_Y + prepadding, h);
 
         ncnn::Mat in;
-        if (opt.use_fp16_storage && opt.use_int8_storage)
+        if (input_16bit)
+        {
+            in.create(w, in_tile_y1 - in_tile_y0, channels, (size_t)4u, 1);
+            const size_t source_plane_size = (size_t)w * h;
+            const size_t tile_plane_size = (size_t)w * (in_tile_y1 - in_tile_y0);
+            for (int channel = 0; channel < channels; channel++)
+            {
+                const float *source = pixeldata_float + (size_t)channel * source_plane_size + (size_t)in_tile_y0 * w;
+                float *destination = (float *)in.channel(channel);
+                memcpy(destination, source, tile_plane_size * sizeof(float));
+            }
+        }
+        else if (opt.use_fp16_storage && opt.use_int8_storage)
         {
             in = ncnn::Mat(w, (in_tile_y1 - in_tile_y0), (unsigned char *)pixeldata + in_tile_y0 * w * channels, (size_t)channels, 1);
         }
@@ -625,7 +628,11 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage) const
         int out_tile_y1 = std::min((yi + 1) * TILE_SIZE_Y, h);
 
         ncnn::VkMat out_gpu;
-        if (opt.use_fp16_storage && opt.use_int8_storage)
+        if (input_16bit)
+        {
+            out_gpu.create(w * scale, (out_tile_y1 - out_tile_y0) * scale, channels, (size_t)4u, 1, blob_vkallocator);
+        }
+        else if (opt.use_fp16_storage && opt.use_int8_storage)
         {
             out_gpu.create(w * scale, (out_tile_y1 - out_tile_y0) * scale, (size_t)channels, 1, blob_vkallocator);
         }
@@ -868,6 +875,7 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage) const
                         net.vulkan_device()->reclaim_staging_allocator(staging_vkallocator);
                         return ret;
                     }
+
                 }
 
                 ncnn::VkMat out_alpha_tile_gpu;
@@ -935,7 +943,11 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage) const
         {
             ncnn::Mat out;
 
-            if (opt.use_fp16_storage && opt.use_int8_storage)
+            if (input_16bit)
+            {
+                out.create(out_gpu.w, out_gpu.h, channels, (size_t)4u, 1);
+            }
+            else if (opt.use_fp16_storage && opt.use_int8_storage)
             {
                 out = ncnn::Mat(out_gpu.w, out_gpu.h, (unsigned char *)outimage.data + yi * scale * TILE_SIZE_Y * w * scale * channels, (size_t)channels, 1);
             }
@@ -944,7 +956,22 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage) const
 
             cmd.submit_and_wait();
 
-            if (!(opt.use_fp16_storage && opt.use_int8_storage))
+            if (input_16bit)
+            {
+                const size_t output_plane_size = (size_t)outimage.w * outimage.h;
+                const size_t tile_plane_size = (size_t)out.w * out.h;
+                const size_t output_y_offset = (size_t)yi * scale * TILE_SIZE_Y * outimage.w;
+                for (int channel = 0; channel < channels; channel++)
+                {
+                    const float *source = (const float *)out.channel(channel);
+                    float *destination = (float *)outimage.channel(channel) + output_y_offset;
+                    for (int row = 0; row < out.h; row++)
+                    {
+                        memcpy(destination + (size_t)row * outimage.w, source + (size_t)row * out.w, (size_t)out.w * sizeof(float));
+                    }
+                }
+            }
+            else if (!(opt.use_fp16_storage && opt.use_int8_storage))
             {
                 if (channels == 3)
                 {

@@ -8,18 +8,15 @@
 #include <filesystem>
 #include <string>
 #include <cmath>
+#include <cstring>
+namespace fs = std::filesystem;
 #if _WIN32
 #include <locale>
 #include <codecvt>
 #endif
 
-namespace fs = std::filesystem;
-
-#if _WIN32
-// image decoder and encoder with wic
-#include "wic_image.h"
-#else // _WIN32
-// image decoder and encoder with stb
+// stb handles the common image formats on every platform. WIC remains used
+// below only for the Windows JPEG path.
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_PSD
 #define STBI_NO_TGA
@@ -30,7 +27,11 @@ namespace fs = std::filesystem;
 #include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
-#endif // _WIN32
+#include <png.h>
+#if _WIN32
+#include "wic_image.h"
+#endif
+#include <tiffio.h>
 #include "webp_image.h"
 #define STB_IMAGE_RESIZE2_IMPLEMENTATION
 #include "stb_image_resize2.h"
@@ -236,8 +237,8 @@ static void print_usage()
 {
     fprintf(stderr, "Usage: upscayl-bin -i infile -o outfile [options]...\n\n");
     fprintf(stderr, "  -h                   show this help\n");
-    fprintf(stderr, "  -i input-path        input image path (jpg/png/webp) or directory\n");
-    fprintf(stderr, "  -o output-path       output image path (jpg/png/webp) or directory\n");
+    fprintf(stderr, "  -i input-path        input image path (jpg/png/webp/tiff) or directory\n");
+    fprintf(stderr, "  -o output-path       output image path (jpg/png/webp/tiff) or directory\n");
     fprintf(stderr, "  -d                   enable daemon/interactive mode\n");
     fprintf(stderr, "  -z model-scale       scale according to the model (can be 2, 3, 4. default=4)\n");
     fprintf(stderr, "  -s output-scale      custom output scale (can be 2, 3, 4. default=4)\n");
@@ -256,7 +257,7 @@ static void print_usage()
     fprintf(stderr, "  -k max-tilesize      maximum auto tile size cap (default=1024)\n");
     fprintf(stderr, "  --max-tilesize N     maximum auto tile size cap (default=1024)\n");
     fprintf(stderr, "  --diagnose-model     validate model compatibility only (no image processing)\n");
-    fprintf(stderr, "  -f format            output image format (jpg/png/webp, default=ext/png)\n");
+    fprintf(stderr, "  -f format            output image format (jpg/png/webp/tiff, default=ext/png)\n");
     fprintf(stderr, "  -v                   verbose output\n");
 }
 
@@ -283,8 +284,8 @@ static void print_daemon_help()
     fprintf(stderr, "\n📡 Daemon Mode Help\n");
     fprintf(stderr, "==================\n\n");
     fprintf(stderr, "Commands:\n");
-    fprintf(stderr, "  -i input-path        input image path (jpg/png/webp) or directory\n");
-    fprintf(stderr, "  -o output-path       output image path (jpg/png/webp) or directory\n");
+    fprintf(stderr, "  -i input-path        input image path (jpg/png/webp/tiff) or directory\n");
+    fprintf(stderr, "  -o output-path       output image path (jpg/png/webp/tiff) or directory\n");
     fprintf(stderr, "  -s output-scale      custom output scale (can be 2, 3, 4. default=4)\n");
     fprintf(stderr, "  -r resize            resize output to dimension (default=WxH:default), use '-r help' for more details\n");
     fprintf(stderr, "  -w width             resize output to a width (default=W:default), use '-r help' for more details\n");
@@ -293,7 +294,7 @@ static void print_daemon_help()
     fprintf(stderr, "  -j load:proc:save    thread count for load/proc/save (default=1:2:2) can be 1:2,2,2:2 for multi-gpu\n");
     fprintf(stderr, "  -x                   enable tta mode\n");
     fprintf(stderr, "  -p                   force fp32 path (disable fp16/int8 storage)\n");
-    fprintf(stderr, "  -f format            output image format (jpg/png/webp, default=ext/png)\n");
+    fprintf(stderr, "  -f format            output image format (jpg/png/webp/tiff, default=ext/png)\n");
     fprintf(stderr, "  help                 Show this help message\n");
     fprintf(stderr, "  quit or exit         Exit daemon mode\n\n");
     fprintf(stderr, "Examples:\n");
@@ -304,8 +305,17 @@ static void print_daemon_help()
 class Task
 {
 public:
+    enum class InputDepth
+    {
+        uint8,
+        uint16,
+        float32
+    };
+
     int id;
     int webp;
+    InputDepth input_depth;
+    bool input_data_external;
     bool outimage_malloced; // Flag to track if outimage.data was allocated with malloc
 
     path_t inpath;
@@ -364,6 +374,133 @@ private:
 TaskQueue toproc;
 TaskQueue tosave;
 
+static bool load_tiff(const path_t &path, int *width, int *height, int *channels, Task::InputDepth *depth, float **data)
+{
+#if _WIN32
+    TIFF *tiff = TIFFOpenW(path.c_str(), "r");
+#else
+    TIFF *tiff = TIFFOpen(path.c_str(), "r");
+#endif
+    if (!tiff)
+        return false;
+
+    uint32_t tiff_width = 0;
+    uint32_t tiff_height = 0;
+    uint16_t samples = 0;
+    uint16_t bits = 0;
+    uint16_t sample_format = SAMPLEFORMAT_UINT;
+    uint16_t planar_config = PLANARCONFIG_CONTIG;
+    uint16_t photometric = PHOTOMETRIC_RGB;
+    TIFFGetField(tiff, TIFFTAG_IMAGEWIDTH, &tiff_width);
+    TIFFGetField(tiff, TIFFTAG_IMAGELENGTH, &tiff_height);
+    TIFFGetField(tiff, TIFFTAG_SAMPLESPERPIXEL, &samples);
+    TIFFGetField(tiff, TIFFTAG_BITSPERSAMPLE, &bits);
+    TIFFGetFieldDefaulted(tiff, TIFFTAG_SAMPLEFORMAT, &sample_format);
+    TIFFGetFieldDefaulted(tiff, TIFFTAG_PLANARCONFIG, &planar_config);
+    TIFFGetFieldDefaulted(tiff, TIFFTAG_PHOTOMETRIC, &photometric);
+
+    if (tiff_width == 0 || tiff_height == 0 || samples < 1 || samples > 4 ||
+        (bits != 8 && bits != 16 && bits != 32) ||
+        (sample_format != SAMPLEFORMAT_UINT && sample_format != SAMPLEFORMAT_IEEEFP) ||
+        (sample_format == SAMPLEFORMAT_IEEEFP && bits != 32) ||
+        (photometric != PHOTOMETRIC_MINISBLACK && photometric != PHOTOMETRIC_RGB) ||
+        planar_config > PLANARCONFIG_SEPARATE || TIFFIsTiled(tiff))
+    {
+        TIFFClose(tiff);
+        return false;
+    }
+
+    const int output_channels = samples == 1 ? 3 : samples == 2 ? 4 : samples;
+    const size_t pixel_count = (size_t)tiff_width * tiff_height;
+    float *output = (float *)malloc(pixel_count * output_channels * sizeof(float));
+    if (!output)
+    {
+        TIFFClose(tiff);
+        return false;
+    }
+
+    if (sample_format == SAMPLEFORMAT_IEEEFP)
+        *depth = Task::InputDepth::float32;
+    else if (bits == 16)
+        *depth = Task::InputDepth::uint16;
+    else
+        *depth = Task::InputDepth::uint8;
+
+    const size_t scanline_samples = (size_t)tiff_width * (planar_config == PLANARCONFIG_CONTIG ? samples : 1);
+    const size_t sample_size = bits / 8;
+    std::vector<unsigned char> scanline(scanline_samples * sample_size);
+    bool success = true;
+    for (uint32_t y = 0; y < tiff_height && success; y++)
+    {
+        const uint16_t plane_count = planar_config == PLANARCONFIG_CONTIG ? 1 : samples;
+        for (uint16_t plane = 0; plane < plane_count && success; plane++)
+        {
+            success = TIFFReadScanline(tiff, scanline.data(), y, plane) >= 0;
+            if (!success)
+                break;
+
+            for (uint32_t x = 0; x < tiff_width; x++)
+            {
+                const size_t destination = ((size_t)y * tiff_width + x) * output_channels;
+                auto read_sample = [&](size_t index) {
+                    if (sample_format == SAMPLEFORMAT_IEEEFP)
+                        return ((const float *)scanline.data())[index] * 255.0f;
+                    if (bits == 16)
+                        return ((const uint16_t *)scanline.data())[index] * (255.0f / 65535.0f);
+                    return ((const uint8_t *)scanline.data())[index] * (255.0f / 255.0f);
+                };
+                if (planar_config == PLANARCONFIG_CONTIG)
+                {
+                    const size_t source = (size_t)x * samples;
+                    if (samples == 1)
+                    {
+                        output[destination + 0] = output[destination + 1] = output[destination + 2] = read_sample(source);
+                    }
+                    else if (samples == 2)
+                    {
+                        output[destination + 0] = output[destination + 1] = output[destination + 2] = read_sample(source);
+                        output[destination + 3] = read_sample(source + 1);
+                    }
+                    else
+                    {
+                        for (uint16_t channel = 0; channel < samples; channel++)
+                            output[destination + channel] = read_sample(source + channel);
+                    }
+                }
+                else if (samples == 1)
+                {
+                    const float value = read_sample(x);
+                    output[destination + 0] = output[destination + 1] = output[destination + 2] = value;
+                }
+                else if (samples == 2)
+                {
+                    if (plane == 0)
+                        output[destination + 0] = output[destination + 1] = output[destination + 2] = read_sample(x);
+                    else
+                        output[destination + 3] = read_sample(x);
+                }
+                else
+                {
+                    output[destination + plane] = read_sample(x);
+                }
+            }
+        }
+    }
+
+    TIFFClose(tiff);
+    if (!success)
+    {
+        free(output);
+        return false;
+    }
+
+    *width = (int)tiff_width;
+    *height = (int)tiff_height;
+    *channels = output_channels;
+    *data = output;
+    return true;
+}
+
 class LoadThreadParams
 {
 public:
@@ -387,8 +524,11 @@ void *load(void *args)
         const path_t &imagepath = ltp->input_files[i];
 
         int webp = 0;
+        Task::InputDepth input_depth = Task::InputDepth::uint8;
 
         unsigned char *pixeldata = 0;
+        unsigned short *pixeldata16 = 0;
+        float *pixeldata32 = 0;
         int w;
         int h;
         int c;
@@ -417,6 +557,27 @@ void *load(void *args)
 
             if (filedata)
             {
+                const path_t input_ext = get_file_extension(imagepath);
+                const bool is_tiff = input_ext == PATHSTR("tif") || input_ext == PATHSTR("TIF") ||
+                    input_ext == PATHSTR("tiff") || input_ext == PATHSTR("TIFF");
+                if (is_tiff)
+                {
+                    if (!load_tiff(imagepath, &w, &h, &c, &input_depth, &pixeldata32))
+                    {
+#if _WIN32
+                        fwprintf(stderr, L"🚨 Error: Couldn't decode TIFF image '%s'!\n", imagepath.c_str());
+#else
+                        fprintf(stderr, "🚨 Error: Couldn't decode TIFF image '%s'!\n", imagepath.c_str());
+#endif
+                    }
+                }
+                if (pixeldata32 || is_tiff)
+                {
+                    free(filedata);
+                    filedata = 0;
+                }
+                else
+                {
                 pixeldata = webp_load(filedata, length, &w, &h, &c);
                 if (pixeldata)
                 {
@@ -425,52 +586,22 @@ void *load(void *args)
                 else
                 {
                     // not webp, try jpg png etc.
-#if _WIN32
-                    pixeldata = wic_decode_image(imagepath.c_str(), &w, &h, &c);
-                    if (pixeldata)
+                    const bool input_16bit = stbi_is_16_bit_from_memory(filedata, length) != 0;
+                    if (input_16bit)
                     {
-                        // WIC channel conversion logic similar to stb_image
-                        if (c == 1)
-                        {
-                            // grayscale -> rgb
-                            unsigned char *rgbdata = (unsigned char *)malloc(w * h * 3);
-                            if (rgbdata)
-                            {
-                                for (int i = 0; i < w * h; i++)
-                                {
-                                    unsigned char gray = pixeldata[i];
-                                    rgbdata[i * 3 + 0] = gray; // B
-                                    rgbdata[i * 3 + 1] = gray; // G
-                                    rgbdata[i * 3 + 2] = gray; // R
-                                }
-                                free(pixeldata);
-                                pixeldata = rgbdata;
-                                c = 3;
-                            }
-                        }
-                        else if (c == 2)
-                        {
-                            // grayscale + alpha -> rgba
-                            unsigned char *rgbadata = (unsigned char *)malloc(w * h * 4);
-                            if (rgbadata)
-                            {
-                                for (int i = 0; i < w * h; i++)
-                                {
-                                    unsigned char gray = pixeldata[i * 2];
-                                    unsigned char alpha = pixeldata[i * 2 + 1];
-                                    rgbadata[i * 4 + 0] = gray;  // B
-                                    rgbadata[i * 4 + 1] = gray;  // G
-                                    rgbadata[i * 4 + 2] = gray;  // R
-                                    rgbadata[i * 4 + 3] = alpha; // A
-                                }
-                                free(pixeldata);
-                                pixeldata = rgbadata;
-                                c = 4;
-                            }
-                        }
+                        input_depth = Task::InputDepth::uint16;
+                        pixeldata16 = stbi_load_16_from_memory(filedata, length, &w, &h, &c, 0);
                     }
-#else  // _WIN32
-                    pixeldata = stbi_load_from_memory(filedata, length, &w, &h, &c, 0);
+                    else
+                    {
+                        pixeldata = stbi_load_from_memory(filedata, length, &w, &h, &c, 0);
+                    }
+                    if (input_16bit && pixeldata16 && (c == 1 || c == 2))
+                    {
+                        stbi_image_free(pixeldata16);
+                        pixeldata16 = stbi_load_16_from_memory(filedata, length, &w, &h, &c, c == 1 ? 3 : 4);
+                        c = c == 1 ? 3 : 4;
+                    }
                     if (pixeldata)
                     {
                         // stb_image auto channel
@@ -489,21 +620,51 @@ void *load(void *args)
                             c = 4;
                         }
                     }
-#endif // _WIN32
                 }
-                free(filedata);
+                }
+                if (filedata)
+                    free(filedata);
             }
         }
-        if (pixeldata)
+        if (pixeldata || pixeldata16 || pixeldata32)
         {
             Task v;
             v.id = i;
+            v.webp = webp;
             v.inpath = imagepath;
             v.outpath = ltp->output_files[i];
+            v.input_depth = input_depth;
+            v.input_data_external = input_depth == Task::InputDepth::uint8 && pixeldata32 == 0;
             v.outimage_malloced = false; // Initially managed by ncnn
 
-            v.inimage = ncnn::Mat(w, h, (void *)pixeldata, (size_t)c, c);
-            v.outimage = ncnn::Mat(w * scale, h * scale, (size_t)c, c);
+            if (pixeldata16 || pixeldata32)
+            {
+                v.inimage.create(w, h, c, (size_t)4u, 1);
+                for (int channel = 0; channel < c; channel++)
+                {
+                    float *dst = (float *)v.inimage.channel(channel);
+                    for (int y = 0; y < h; y++)
+                    {
+                        for (int x = 0; x < w; x++)
+                        {
+                            const size_t pixel = ((size_t)y * w + x) * c + channel;
+                            dst[y * w + x] = pixeldata32
+                                ? pixeldata32[pixel]
+                                : pixeldata16[pixel] * (255.0f / 65535.0f);
+                        }
+                    }
+                }
+                stbi_image_free(pixeldata16);
+                pixeldata16 = 0;
+                free(pixeldata32);
+                pixeldata32 = 0;
+                v.outimage.create(w * scale, h * scale, c, (size_t)4u, 1);
+            }
+            else
+            {
+                v.inimage = ncnn::Mat(w, h, (void *)pixeldata, (size_t)c, c);
+                v.outimage = ncnn::Mat(w * scale, h * scale, (size_t)c, c);
+            }
 
             path_t ext = get_file_extension(v.outpath);
             if (c == 4 && (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG")))
@@ -619,7 +780,17 @@ void resize_output_image(Task &v, const SaveThreadParams *stp)
     fprintf(stderr, "🏞️ Resizing image according to desired resolution\n");
 #endif // _WIN32
 
-    int c = v.outimage.elempack;
+        if (v.outimage.elempack == 1)
+        {
+    #if _WIN32
+        fwprintf(stderr, L"⚠️ 16-bit resize is not available yet; preserving the model output dimensions.\n");
+    #else
+        fprintf(stderr, "⚠️ 16-bit resize is not available yet; preserving the model output dimensions.\n");
+    #endif
+        return;
+        }
+
+        int c = v.outimage.elempack;
 
     stbir_pixel_layout layout = static_cast<stbir_pixel_layout>(c);
 
@@ -689,6 +860,127 @@ void scale_output_image(Task &v, const SaveThreadParams *stp)
 #endif // _WIN32
 }
 
+static int write_png_16(const char *path, const ncnn::Mat &image, int compression)
+{
+    const int width = image.w;
+    const int height = image.h;
+    const int channels = image.c;
+    FILE *file = fopen(path, "wb");
+    if (!file)
+        return 0;
+
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    png_infop info = png ? png_create_info_struct(png) : nullptr;
+    if (!info)
+    {
+        if (png)
+            png_destroy_write_struct(&png, nullptr);
+        fclose(file);
+        return 0;
+    }
+
+    if (setjmp(png_jmpbuf(png)))
+    {
+        png_destroy_write_struct(&png, &info);
+        fclose(file);
+        return 0;
+    }
+
+    const int color_type = channels == 1 ? PNG_COLOR_TYPE_GRAY :
+                           channels == 2 ? PNG_COLOR_TYPE_GRAY_ALPHA :
+                           channels == 3 ? PNG_COLOR_TYPE_RGB : PNG_COLOR_TYPE_RGBA;
+    png_init_io(png, file);
+    png_set_IHDR(png, info, width, height, 16, color_type, PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    if (compression > 0)
+        png_set_compression_level(png, std::clamp(compression, 0, 9));
+    png_write_info(png, info);
+
+    std::vector<unsigned char> row((size_t)width * channels * sizeof(uint16_t));
+    for (int y = 0; y < height; y++)
+    {
+        for (int x = 0; x < width; x++)
+        {
+            for (int channel = 0; channel < channels; channel++)
+            {
+                const float value = std::clamp(((const float *)image.channel(channel))[(size_t)y * width + x] / 255.0f, 0.0f, 1.0f);
+                const uint16_t sample = (uint16_t)std::lround(value * 65535.0f);
+                const size_t offset = ((size_t)x * channels + channel) * sizeof(uint16_t);
+                row[offset + 0] = (unsigned char)(sample >> 8);
+                row[offset + 1] = (unsigned char)(sample & 0xff);
+            }
+        }
+        png_write_row(png, (png_bytep)row.data());
+    }
+    png_write_end(png, nullptr);
+    png_destroy_write_struct(&png, &info);
+    fclose(file);
+    return 1;
+}
+
+static int write_tiff(const path_t &path, int width, int height, int channels, Task::InputDepth depth, const ncnn::Mat &image)
+{
+#if _WIN32
+    TIFF *tiff = TIFFOpenW(path.c_str(), "w");
+#else
+    TIFF *tiff = TIFFOpen(path.c_str(), "w");
+#endif
+    if (!tiff)
+        return 0;
+
+    TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH, width);
+    TIFFSetField(tiff, TIFFTAG_IMAGELENGTH, height);
+    TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL, channels);
+    const bool is_float = depth == Task::InputDepth::float32;
+    const uint16_t bits = is_float ? 32 : depth == Task::InputDepth::uint16 ? 16 : 8;
+    TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE, bits);
+    TIFFSetField(tiff, TIFFTAG_SAMPLEFORMAT, is_float ? SAMPLEFORMAT_IEEEFP : SAMPLEFORMAT_UINT);
+    TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC, channels >= 3 ? PHOTOMETRIC_RGB : PHOTOMETRIC_MINISBLACK);
+    if (channels == 2 || channels == 4)
+    {
+        uint16_t extra_sample = EXTRASAMPLE_UNASSALPHA;
+        TIFFSetField(tiff, TIFFTAG_EXTRASAMPLES, 1, &extra_sample);
+    }
+    TIFFSetField(tiff, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+    TIFFSetField(tiff, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
+    TIFFSetField(tiff, TIFFTAG_COMPRESSION, COMPRESSION_NONE);
+
+    std::vector<unsigned char> row((size_t)width * channels * bits / 8);
+    bool success = true;
+    for (int y = 0; y < height && success; y++)
+    {
+        for (int x = 0; x < width; x++)
+        {
+            for (int channel = 0; channel < channels; channel++)
+            {
+                const size_t pixel = (size_t)y * width + x;
+                const float value = image.elemsize == 4u && image.elempack == 1
+                    ? std::clamp(((const float *)image.channel(channel))[pixel], 0.0f, 255.0f)
+                    : ((const unsigned char *)image.data)[pixel * channels + channel];
+                const size_t index = (size_t)x * channels + channel;
+                if (is_float)
+                {
+                    const float sample = value / 255.0f;
+                    std::memcpy(row.data() + index * sizeof(float), &sample, sizeof(float));
+                }
+                else if (bits == 16)
+                {
+                    const uint16_t sample = (uint16_t)std::lround(value * (65535.0f / 255.0f));
+                    std::memcpy(row.data() + index * sizeof(uint16_t), &sample, sizeof(uint16_t));
+                }
+                else
+                {
+                    const uint8_t sample = (uint8_t)std::lround(value);
+                    row[index] = sample;
+                }
+            }
+        }
+        success = TIFFWriteScanline(tiff, row.data(), y, 0) >= 0;
+    }
+    TIFFClose(tiff);
+    return success ? 1 : 0;
+}
+
 void *save(void *args)
 {
     const SaveThreadParams *stp = (const SaveThreadParams *)args;
@@ -703,7 +995,8 @@ void *save(void *args)
         if (v.id == -233)
             break;
 
-        // free input pixel data
+        // Free decoder-owned input data; 16-bit input is owned by ncnn::Mat.
+        if (v.input_data_external)
         {
             unsigned char *pixeldata = (unsigned char *)v.inimage.data;
             if (v.webp == 1)
@@ -720,12 +1013,12 @@ void *save(void *args)
             }
         }
 
-        if (stp->hasOutputScale)
+        if (stp->hasOutputScale && v.outimage.elempack != 1)
         {
             scale_output_image(v, stp);
         }
 
-        if ((stp->resizeProvided || stp->hasCustomWidth) && !stp->hasOutputScale)
+        if ((stp->resizeProvided || stp->hasCustomWidth) && !stp->hasOutputScale && v.outimage.elempack != 1)
         {
             resize_output_image(v, stp);
         }
@@ -748,15 +1041,21 @@ void *save(void *args)
             fs::create_directories(parent_path);
         }
 
-        if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
+        if (v.input_depth == Task::InputDepth::uint16 && (ext == PATHSTR("png") || ext == PATHSTR("PNG")))
+        {
+            success = write_png_16(v.outpath.c_str(), v.outimage, stp->compression);
+        }
+        else if ((v.input_depth == Task::InputDepth::uint8 || v.input_depth == Task::InputDepth::uint16 || v.input_depth == Task::InputDepth::float32) &&
+             (ext == PATHSTR("tif") || ext == PATHSTR("TIF") || ext == PATHSTR("tiff") || ext == PATHSTR("TIFF")))
+        {
+            success = write_tiff(v.outpath, v.outimage.w, v.outimage.h, v.outimage.c, v.input_depth, v.outimage);
+        }
+        else if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
         {
             success = webp_save(v.outpath.c_str(), v.outimage.w, v.outimage.h, v.outimage.elempack, (const unsigned char *)v.outimage.data, 100 - (int)stp->compression);
         }
         else if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
         {
-#if _WIN32
-            success = wic_encode_image(v.outpath.c_str(), v.outimage.w, v.outimage.h, v.outimage.elempack, v.outimage.data);
-#else
             // if compression is more than 0 make stbi_write_png_compression_level = 9
             if (stp->compression > 0)
             {
@@ -767,7 +1066,6 @@ void *save(void *args)
                 stbi_write_png_compression_level = 9;
             }
             success = stbi_write_png(v.outpath.c_str(), v.outimage.w, v.outimage.h, v.outimage.elempack, v.outimage.data, 0);
-#endif
         }
         else if (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG"))
         {
@@ -1070,7 +1368,7 @@ static int run_daemon_mode(ProcessParams &params)
     originalParams = params;
 
     // Load model once and keep it in memory
-    int prepadding = 0;
+    int prepadding = 10;
     if (params.model.find(PATHSTR("models")) != path_t::npos || params.model.find(PATHSTR("models2")) != path_t::npos)
     {
         prepadding = 10;
@@ -1893,7 +2191,7 @@ int main(int argc, char **argv)
         }
     }
 
-    int prepadding = 0;
+    int prepadding = 10;
 
     if (model.find(PATHSTR("models")) != path_t::npos || model.find(PATHSTR("models2")) != path_t::npos)
     {
