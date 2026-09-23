@@ -371,6 +371,8 @@ private:
     std::queue<Task> tasks;
 };
 
+static int write_tiff(const path_t &path, int width, int height, int channels, Task::InputDepth depth, const ncnn::Mat &image);
+
 TaskQueue toproc;
 TaskQueue tosave;
 

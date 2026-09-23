@@ -577,7 +577,7 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage) const
         if (input_16bit)
         {
             in.create(w, in_tile_y1 - in_tile_y0, channels, (size_t)4u, 1);
-            const size_t source_plane_size = (size_t)w * h;
+            const size_t source_plane_size = inimage.cstep;
             const size_t tile_plane_size = (size_t)w * (in_tile_y1 - in_tile_y0);
             for (int channel = 0; channel < channels; channel++)
             {
