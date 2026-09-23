@@ -862,12 +862,49 @@ void scale_output_image(Task &v, const SaveThreadParams *stp)
 #endif // _WIN32
 }
 
-static int write_png_16(const char *path, const ncnn::Mat &image, int compression)
+static FILE *open_output_file(const path_t &path)
+{
+#if _WIN32
+    return _wfopen(path.c_str(), L"wb");
+#else
+    return fopen(path.c_str(), "wb");
+#endif
+}
+
+struct StbiFileWriter
+{
+    FILE *file;
+    bool failed;
+};
+
+static void stbi_write_to_file(void *context, void *data, int size)
+{
+    StbiFileWriter *writer = static_cast<StbiFileWriter *>(context);
+    if (fwrite(data, 1, (size_t)size, writer->file) != (size_t)size)
+        writer->failed = true;
+}
+
+static int write_png_8(const path_t &path, const ncnn::Mat &image)
+{
+    FILE *file = open_output_file(path);
+    if (!file)
+        return 0;
+
+    StbiFileWriter writer = {file, false};
+    const int success = stbi_write_png_to_func(stbi_write_to_file, &writer,
+                                               image.w, image.h, image.elempack,
+                                               image.data, 0);
+    if (fclose(file) != 0)
+        writer.failed = true;
+    return success && !writer.failed;
+}
+
+static int write_png_16(const path_t &path, const ncnn::Mat &image, int compression)
 {
     const int width = image.w;
     const int height = image.h;
     const int channels = image.c;
-    FILE *file = fopen(path, "wb");
+    FILE *file = open_output_file(path);
     if (!file)
         return 0;
 
@@ -1039,7 +1076,11 @@ void *save(void *args)
 
         if (!fs::exists(parent_path))
         {
+#if _WIN32
+            fwprintf(stderr, L"📂 Creating directory: %ls\n", parent_path.c_str());
+#else
             fprintf(stderr, "📂 Creating directory: %s\n", parent_path.c_str());
+#endif
             fs::create_directories(parent_path);
         }
 
@@ -1067,7 +1108,7 @@ void *save(void *args)
             {
                 stbi_write_png_compression_level = 9;
             }
-            success = stbi_write_png(v.outpath.c_str(), v.outimage.w, v.outimage.h, v.outimage.elempack, v.outimage.data, 0);
+            success = write_png_8(v.outpath, v.outimage);
         }
         else if (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG"))
         {
@@ -1098,7 +1139,7 @@ void *save(void *args)
         else
         {
 #if _WIN32
-            fwprintf(stderr, L"🚨 Error: Couldn't write the image %s\n", v.outpath.c_str());
+            fwprintf(stderr, L"🚨 Error: Couldn't write the image %ls\n", v.outpath.c_str());
 #else
             fprintf(stderr, "🚨 Error: Couldn't write the image %s\n", v.outpath.c_str());
 #endif
