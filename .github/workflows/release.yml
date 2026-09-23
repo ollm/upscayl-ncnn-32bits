@@ -14,7 +14,7 @@ on:
         default: true
         description: 'Create GitHub release'
 env:
-  APPLICATION_NAME: upscayl-bin
+  APPLICATION_NAME: upscayl-bin-32bits
   VK_VERSION: 1.4.335.0
   MOLTEN_VK_INCLUDE_PATH: macOS/include
   MOLTEN_VK_LIB_PATH: macOS/lib/MoltenVK.xcframework/macos-arm64_x86_64/libMoltenVK.a
@@ -302,5 +302,5 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ needs.setup.outputs.VERSION }}
-          name: upscayl-bin-${{ needs.setup.outputs.VERSION }}
+          name: upscayl-bin-32bits-${{ needs.setup.outputs.VERSION }}
           files: artifacts/**/**/*.zip
